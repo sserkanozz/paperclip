@@ -30,6 +30,7 @@ export function openSkillPanelState(
 }
 
 export type TaskSidePanelTabPayload =
+  | { kind: "browser"; browserId: string }
   | { kind: "properties" }
   | { kind: "subtasks" }
   | { kind: "artifacts" }
@@ -88,6 +89,7 @@ function parsePayload(value: unknown): TaskSidePanelTabPayload | null {
   const input = record(value);
   if (!input) return null;
   const kind = input.kind;
+  if (kind === "browser") return typeof input.browserId === "string" && /^[0-9a-f-]{36}$/i.test(input.browserId) ? { kind, browserId: input.browserId } : null;
   if (kind === "properties") return { kind };
   if (kind === "subtasks") return { kind };
   if (kind === "artifacts") return { kind };
@@ -277,4 +279,8 @@ export function taskPanelWorkspaceFileTab(input: {
       column: input.column ?? null,
     },
   };
+}
+
+export function taskPanelBrowserTab(browserId: string): SidePanelTabRecord<TaskSidePanelTabPayload> {
+  return { id: `browser:${browserId}`, type: "browser", label: "Browser", closable: true, contentMode: "full-bleed", payload: { kind: "browser", browserId } };
 }
