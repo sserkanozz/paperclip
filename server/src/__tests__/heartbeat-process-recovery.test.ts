@@ -110,6 +110,8 @@ import {
   commitNativeStatusDecision,
   NativeStatusRaceError,
 } from "../services/native-runtime/status-decision-committer.js";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 const mockTelemetryClient = vi.hoisted(() => ({
   track: vi.fn(),
   hashPrivateRef: vi.fn(() => "test-private-reference"),
@@ -1776,6 +1778,239 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     expect(wake.status).toBe("deferred_issue_execution");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  // HEA-60: a legacy queued run cancelled before the provider ever ran (null
+  // process identity, no session checkpoint, no provider-progress event) must
+  // not become a permanent legacy_execution_requires_reconciliation dead end.
+  // This chains the real production entry points: cancelStaleQueuedRun (the
+  // adapter that decides and persists the cancellation) into
+  // reconcileStrandedAssignedIssues (the scan that must then continue the
+  // same issue through its ordinary path).
+  it("hands a pre-provider stale queued-run cancellation back to ordinary continuation instead of a reconciliation hold (HEA-60)", async () => {
+    const { createPostgresRunDispatchAdapter } = await import(
+      "../modules/run-dispatch/adapters/postgres.js"
+    );
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Pre-provider stale queued run",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "retry",
+      status: "queued",
+      // ai_connection_busy requires the execution lock; the issue never
+      // recorded this queued run as its executionRunId, so the lock check
+      // fails it as stale without ever touching the issue's assignee/status.
+      contextSnapshot: { issueId, retryReason: "ai_connection_busy" },
+    });
+
+    const cancellation = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+      runId,
+      companyId,
+      expectedStatus: "queued",
+      now: new Date(),
+    });
+    expect(cancellation).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_execution_lock_changed",
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const legacyActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"),
+        ),
+      );
+    expect(legacyActions).toHaveLength(0);
+
+    // The same issue's ordinary continuation mechanism actually ran a
+    // successor for it — this is not merely "unblocked", it is a real,
+    // planned continuation.
+    const successors = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(successors.length).toBeGreaterThan(0);
+    expect(result.continuationRequeued + result.dispatchRequeued).toBeGreaterThan(0);
+  });
+
+  // HEA-101: a deliberate review/approval park (issue_continuation_waiting_on_review)
+  // is not a lost execution path. The real run carried only ordinary lifecycle
+  // heartbeat events (queued/claimed) and no provider-evidence event at all —
+  // this must stay on the deliberate-wait path (no blind auto-replay), and must
+  // not turn into a permanent legacy reconciliation blocker that would stop a
+  // later, genuine user turn from reaching this issue.
+  it("keeps issue_continuation_waiting_on_review on the deliberate-wait path despite recorded lifecycle events, without auto-replay or a permanent blocker (HEA-101)", async () => {
+    const { createPostgresRunDispatchAdapter } = await import(
+      "../modules/run-dispatch/adapters/postgres.js"
+    );
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Continuation parked for review",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const documentId = randomUUID();
+    const revisionId = randomUUID();
+    const summaryBody = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Wait for reviewer feedback or approval before continuing executor work.",
+    ].join("\n");
+    await db.insert(documents).values({
+      id: documentId,
+      companyId,
+      title: "Continuation Summary",
+      format: "markdown",
+      latestBody: summaryBody,
+      latestRevisionId: revisionId,
+      latestRevisionNumber: 1,
+      createdByAgentId: agentId,
+      updatedByAgentId: agentId,
+    });
+    await db.insert(documentRevisions).values({
+      id: revisionId,
+      companyId,
+      documentId,
+      revisionNumber: 1,
+      title: "Continuation Summary",
+      format: "markdown",
+      body: summaryBody,
+      createdByAgentId: agentId,
+    });
+    await db.insert(issueDocuments).values({
+      companyId,
+      issueId,
+      documentId,
+      key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+    });
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "retry",
+      status: "queued",
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+    });
+    // The real HEA-101 run carried exactly two ordinary lifecycle heartbeat
+    // events and zero provider-evidence events (no harness.ready,
+    // session.started/resumed/updated, turn.started, provider.event, or
+    // provider.rpc_result). Go through appendHeartbeatRunEvent (not a raw
+    // insert) so its sequence counter stays consistent with the run's own
+    // nextEventSeq — cancelStaleRunInTx appends its own lifecycle event too.
+    await appendHeartbeatRunEvent(db, {
+      companyId, agentId, runId, eventType: "lifecycle", stream: "system", level: "info", message: "Run queued",
+    });
+    await appendHeartbeatRunEvent(db, {
+      companyId, agentId, runId, eventType: "lifecycle", stream: "system", level: "info", message: "Run claimed",
+    });
+
+    const cancellation = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+      runId,
+      companyId,
+      expectedStatus: "queued",
+      now: new Date(),
+    });
+    expect(cancellation).toMatchObject({
+      outcome: "cancelled",
+      errorCode: "issue_continuation_waiting_on_review",
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actions.find((action) => action.cause === "legacy_execution_requires_reconciliation")).toBeUndefined();
+    expect(
+      actions.find((action) => (action.evidence as Record<string, unknown> | null)?.automaticRecovery
+        && (action.evidence as any).automaticRecovery.replay === "blocked"),
+    ).toBeUndefined();
+
+    // No blind auto-replay of the parked run.
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+    // No permanent execution blocker stands in front of the next genuine turn.
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
   });
 
   it("leaves hidden issues out of stranded-issue reconciliation", async () => {

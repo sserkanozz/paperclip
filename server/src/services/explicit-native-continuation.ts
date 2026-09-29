@@ -2,6 +2,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "./native-local-process-stop.js";
+import { nativeSessionProviderEvidence } from "./native-runtime/native-session-resume.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
@@ -199,6 +200,17 @@ export async function admitExplicitNativeContinuation(input: {
     }
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
     if (cancelledStartup) cancelledStartupIds.add(run.id);
+    // hasNativeLocalProcessStop/hasHistoricalSuspendedNativeSession are
+    // native-only by construction (they require runtimeMode "native"), so a
+    // legacy run can never satisfy them. Without this, a legacy conversation
+    // run that never reached execution-start, has no session checkpoint, and
+    // has no recorded provider-progress event would stay stuck behind
+    // "process_identity_missing" forever, even though legacyUserTurn already
+    // proves this is an authorized new conversation turn, not a replay.
+    const legacyNeverStarted = legacyUserTurn && run.startedAt === null &&
+      !run.processPid && !run.processGroupId &&
+      (run.runnerProfileJson as Record<string, unknown> | null)?.sessionCheckpoint == null &&
+      !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id);
     if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
     // A provider failure can finish the normal result/assessment commit path.
     // Its accepted failed result is immutable history, not a live controller.
@@ -231,7 +243,7 @@ export async function admitExplicitNativeContinuation(input: {
       }))) return null;
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
-      if (!unusedAdmission && !cancelledStartup) {
+      if (!unusedAdmission && !cancelledStartup && !legacyNeverStarted) {
         // A missing process identity is not evidence that a provider exited.
         if (!run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&

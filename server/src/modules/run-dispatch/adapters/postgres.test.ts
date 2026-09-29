@@ -24,6 +24,8 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
+import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -610,6 +612,139 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    // HEA-60: a legacy run cancelled before the provider ever ran (no process
+    // identity, no session checkpoint, no provider-progress event) must record
+    // that no prior provider action exists, so legacyExecutionNeedsReconciliation
+    // can hand the issue back to its ordinary continuation path instead of a
+    // permanent reconciliation hold. See heartbeat-process-recovery.test.ts for
+    // the end-to-end proof that this actually reaches ordinary continuation.
+    it("records provider-never-started evidence for a pre-provider stale cancellation (HEA-60)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.resultJson).toMatchObject({
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      });
+      expect(legacyExecutionNeedsReconciliation(persisted!)).toBe(false);
+    });
+
+    // Safety net: any genuine evidence the provider might have run — a
+    // recorded provider-progress event, a live process identity, or a
+    // persisted session checkpoint — must keep this on the
+    // reconciliation-required path. Only the combination of none of these
+    // proves nothing happened; a null process id/start time alone is not
+    // enough (see cancelStaleRunInTx).
+    it("keeps a stale cancellation with a recorded provider-progress event on the reconciliation-required path (uncertain outcome)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      await appendHeartbeatRunEvent(db, {
+        companyId, agentId, runId, eventType: "session.started", stream: "system", level: "info",
+        message: "Session started",
+      });
+
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.resultJson).not.toHaveProperty("executionRecovery");
+      expect(legacyExecutionNeedsReconciliation(persisted!)).toBe(true);
+    });
+
+    it("keeps a stale cancellation with a recorded process identity on the reconciliation-required path (uncertain outcome)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ processPid: 4242, processStartedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.resultJson).not.toHaveProperty("executionRecovery");
+      expect(legacyExecutionNeedsReconciliation(persisted!)).toBe(true);
+    });
+
+    it("keeps a stale cancellation with a persisted session checkpoint on the reconciliation-required path (uncertain outcome)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ runnerProfileJson: { sessionCheckpoint: { sessionId: "session-1" } } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.resultJson).not.toHaveProperty("executionRecovery");
+      expect(legacyExecutionNeedsReconciliation(persisted!)).toBe(true);
+    });
+
     it(
       "reads the locked issue state and cancels in the same semantic transaction",
       async () => {
@@ -690,6 +825,68 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_continuation_waiting_on_review",
       });
+    });
+
+    // HEA-101: a deliberate review/approval park is not a lost execution
+    // path. Ordinary lifecycle events (queued, claimed, ...) — the real
+    // HEA-101 run carried exactly two of these — are not provider evidence
+    // and must not be mistaken for it. Recording that no provider action
+    // happened must not itself authorize a blind replay — it only lets the
+    // deliberate-wait classification own this run instead of the generic
+    // legacy reconciliation gate. See heartbeat-process-recovery.test.ts for
+    // the end-to-end proof that no auto-replay and no permanent blocker result.
+    it("keeps issue_continuation_waiting_on_review pre-provider despite recorded lifecycle events (HEA-101)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedContinuationSummary({
+        companyId,
+        issueId,
+        agentId,
+        body: [
+          "# Continuation Summary",
+          "",
+          "## Next Action",
+          "",
+          "- Wait for reviewer feedback or approval before continuing executor work.",
+        ].join("\n"),
+      });
+
+      const adapter = createPostgresRunDispatchAdapter(db);
+      const runId = await seedRun({
+        companyId,
+        agentId,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+        },
+      });
+      await appendHeartbeatRunEvent(db, {
+        companyId, agentId, runId, eventType: "lifecycle", stream: "system", level: "info",
+        message: "Run queued",
+      });
+      await appendHeartbeatRunEvent(db, {
+        companyId, agentId, runId, eventType: "lifecycle", stream: "system", level: "info",
+        message: "Run claimed",
+      });
+
+      const result = await adapter.cancelStaleQueuedRun({
+        runId,
+        companyId,
+        expectedStatus: "queued",
+        now: new Date(),
+      });
+      expect(result).toMatchObject({
+        outcome: "cancelled",
+        errorCode: "issue_continuation_waiting_on_review",
+      });
+
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(persisted?.resultJson).toMatchObject({
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      });
+      expect(legacyExecutionNeedsReconciliation(persisted!)).toBe(false);
     });
   });
 

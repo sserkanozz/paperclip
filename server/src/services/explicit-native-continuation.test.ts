@@ -810,6 +810,58 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
+  // HEA-101 (live): hasNativeLocalProcessStop/hasHistoricalSuspendedNativeSession
+  // are native-only by construction, so a legacy run can never satisfy them.
+  // unusedAdmission only recognizes errorCode "execution_reconciliation_required",
+  // not the legacy_execution_requires_reconciliation cause. A genuinely
+  // never-started legacy conversation run (no process identity, no session
+  // checkpoint, no provider-progress event) must still admit the next real
+  // user message instead of getting stuck behind "process_identity_missing"
+  // forever.
+  it("admits a legacy conversation turn on a never-started run with no process, checkpoint, or provider-progress evidence", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy", nativeIssueId: null, processPid: null, processGroupId: null,
+      errorCode: "issue_execution_lock_changed",
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId, commentId: f.commentId });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  // Safety net: a live process, a persisted session checkpoint, or an actual
+  // recorded provider-progress event must all still keep the hold — only the
+  // combination of none of these proves the provider never ran.
+  it.each([
+    { label: "a live process", apply: async (f: Fixture) => {
+      await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    } },
+    { label: "a persisted session checkpoint", apply: async (f: Fixture) => {
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { sessionCheckpoint: { sessionId: "session-1" } } })
+        .where(eq(heartbeatRuns.id, f.sourceRunId));
+    } },
+    { label: "a recorded adapter invocation event", apply: async (f: Fixture) => {
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.sourceRunId,
+        agentId: f.agentId, seq: 1, eventType: "adapter.invoke", payload: { adapterType: "openai_local" } });
+    } },
+  ])("keeps the hold for a legacy run with $label (uncertain outcome)", async ({ apply }) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy", nativeIssueId: null, processPid: null, processGroupId: null,
+      errorCode: "issue_execution_lock_changed",
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await apply(f);
+    expect(await admit(f)).toBeNull();
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+  });
+
   it.each([true, false])("acknowledges a legacy remote Stop only after confirmed lease cleanup: %s", async confirmed => {
     const f = await seed();
     await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));

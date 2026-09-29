@@ -1,6 +1,7 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
+import { nativeSessionProviderEvidence } from "../../../services/native-runtime/native-session-resume.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -867,6 +868,29 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
   ): Promise<CancelStaleQueuedRunOutcome> {
+      const priorResultJson = parseObject(run.resultJson);
+      // A null process identity alone is not proof the provider never ran — a
+      // crash can lose the pid/start time after real actions already
+      // happened. Only when the persisted row also never reached
+      // execution-start, carries no session checkpoint, and has no recorded
+      // provider-progress event (the same harness.ready/session.*/turn.started/
+      // provider.* set nativeSessionProviderEvidence checks before reusing a
+      // native bootstrap) is it safe to record that no prior provider action
+      // exists here to reconcile. This does not change how
+      // issue_continuation_waiting_on_review is handled afterward —
+      // legacyExecutionNeedsReconciliation and classifyContinuationFailure's
+      // deliberate-wait path downstream still own that decision; this only
+      // stops the generic reconciliation gate from intercepting it first.
+      const providerNeverStarted =
+        decision.errorCode !== "execution_reconciliation_required" &&
+        run.runtimeMode !== "native" &&
+        priorResultJson.executionRecovery == null &&
+        run.startedAt === null &&
+        run.processPid === null &&
+        run.processGroupId === null &&
+        run.processStartedAt === null &&
+        parseObject(run.runnerProfileJson).sessionCheckpoint == null &&
+        !(await nativeSessionProviderEvidence(tx, [run.id])).has(run.id);
       const [row] = await tx
         .update(heartbeatRuns)
         .set({
@@ -875,10 +899,13 @@ export function createPostgresRunDispatchAdapter(
           error: decision.reason,
           errorCode: decision.errorCode,
           resultJson: {
-            ...parseObject(run.resultJson),
+            ...priorResultJson,
             stopReason: decision.errorCode,
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
+              : {}),
+            ...(providerNeverStarted
+              ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
               : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
