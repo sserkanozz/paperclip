@@ -105,8 +105,8 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string) =>
-    vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+  const createGitCheckoutRunCommand = (sha: string, options: { serverBundled?: boolean } = {}) =>
+    vi.fn(async (file: string, args: string[], commandOptions?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
       if (file === "tar") {
@@ -114,7 +114,7 @@ describe("managed install commands", () => {
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" } } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, files: ["dist", "ui-dist"], ...(options.serverBundled ? { bundleDependencies: ["hermes-paperclip-adapter"] } : {}) } },
         ];
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
@@ -135,16 +135,29 @@ describe("managed install commands", () => {
         }
         return { stdout: "", stderr: "" };
       }
-      if (file === "bash") return { stdout: "", stderr: "" };
+      if (file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh") {
+        fs.mkdirSync(path.join(commandOptions!.cwd!, "server", "ui-dist"), { recursive: true });
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "bash") {
+        if (commandOptions?.cwd) fs.mkdirSync(path.join(commandOptions.cwd, "server", "dist"), { recursive: true });
+        return { stdout: "", stderr: "" };
+      }
       if (file === "npm" && args[0] === "pack") {
-        const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
+        const packageName = args[1]?.includes("workspace-package-")
+          ? (JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")) as { name: string }).name.replace("@", "").replace("/", "-")
+          : "paperclipai";
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
-        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
+        const sourcePackage = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")) as { name: string; files?: string[] };
+        for (const entry of sourcePackage.files ?? []) {
+          if (!fs.existsSync(path.join(args[1], entry))) throw new Error(`ENOENT: ${path.join(args[1], entry)}`);
+        }
+        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: sourcePackage.name, version: "0.3.1" }));
         return { stdout: "", stderr: "" };
       }
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
@@ -186,6 +199,20 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("prepares server/ui-dist with the release UI script before staging a bundled server package", async () => {
+    const sha = "e".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const calls = runCommand.mock.calls;
+    const uiDistIndex = calls.findIndex(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh");
+    const serverStageIndex = calls.findIndex(([file, args]) =>
+      file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && args[1]?.endsWith(`${path.sep}server`));
+    expect(uiDistIndex).toBeGreaterThan(-1);
+    expect(serverStageIndex).toBeGreaterThan(uiDistIndex);
+    expect(calls[uiDistIndex]?.[2]?.env).not.toHaveProperty("NODE_ENV");
+    expect(calls.filter(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh")).toHaveLength(1);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
