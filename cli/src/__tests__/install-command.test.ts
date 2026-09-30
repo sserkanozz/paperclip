@@ -105,7 +105,7 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string, options: { serverBundled?: boolean } = {}) =>
+  const createGitCheckoutRunCommand = (sha: string, options: { serverBundled?: boolean; withLocalAdapters?: boolean } = {}) =>
     vi.fn(async (file: string, args: string[], commandOptions?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
@@ -114,8 +114,13 @@ describe("managed install commands", () => {
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, files: ["dist", "ui-dist"], ...(options.serverBundled ? { bundleDependencies: ["hermes-paperclip-adapter"] } : {}) } },
+          ...(options.withLocalAdapters
+            ? ["claude-local", "codex-local"].map((adapter) => ({ dir: `packages/adapters/${adapter}`, name: `@paperclipai/adapter-${adapter}`, packageJson: { name: `@paperclipai/adapter-${adapter}`, version: "0.3.1", files: ["dist", "skills"] } }))
+            : []),
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*", ...(options.withLocalAdapters ? { "@paperclipai/adapter-claude-local": "workspace:*", "@paperclipai/adapter-codex-local": "workspace:*" } : {}) }, files: ["dist", "ui-dist", "skills"], ...(options.serverBundled ? { bundleDependencies: ["hermes-paperclip-adapter"] } : {}) } },
         ];
+        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "# paperclip\n");
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
@@ -123,14 +128,21 @@ describe("managed install commands", () => {
         for (const workspacePackage of packages) {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
           fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
+          if (workspacePackage.dir.startsWith("packages/adapters/")) fs.mkdirSync(path.join(checkout, workspacePackage.dir, "dist"), { recursive: true });
         }
         return { stdout: "", stderr: "" };
       }
       if (file === "corepack") {
         if (args.includes("pack")) {
           const destination = args[args.indexOf("--pack-destination") + 1];
-          const packageDir = args[args.indexOf("--dir") + 1];
-          const packageName = packageDir === "server" ? "paperclipai-server" : "paperclipai-shared";
+          const packageDir = path.join(commandOptions!.cwd!, args[args.indexOf("--dir") + 1]);
+          // Simulate server prepack (ui-dist + build); `skills` is never produced by prepack.
+          if (packageDir.endsWith(`${path.sep}server`)) for (const entry of ["dist", "ui-dist"]) fs.mkdirSync(path.join(packageDir, entry), { recursive: true });
+          const sourcePackage = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { name: string; files?: string[] };
+          for (const entry of sourcePackage.files ?? []) {
+            if (!fs.existsSync(path.join(packageDir, entry))) throw new Error(`packed ${sourcePackage.name} without files entry ${entry}`);
+          }
+          const packageName = sourcePackage.name.replace("@", "").replace("/", "-");
           fs.writeFileSync(path.join(destination, `${packageName}-0.3.1.tgz`), "package");
         }
         return { stdout: "", stderr: "" };
@@ -213,6 +225,23 @@ describe("managed install commands", () => {
     expect(serverStageIndex).toBeGreaterThan(uiDistIndex);
     expect(calls[uiDistIndex]?.[2]?.env).not.toHaveProperty("NODE_ENV");
     expect(calls.filter(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh")).toHaveLength(1);
+  });
+
+  it("stages root skills into server and local adapter packages before packing, as release.sh does", async () => {
+    const sha = "f".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true, withLocalAdapters: true });
+    let stagedSkills: string[] = [];
+    const recordingRunCommand = vi.fn(async (file: string, args: string[], commandOptions?: Parameters<CommandRunner>[2]) => {
+      if (file === "npm" && args[0] === "install") {
+        const checkout = path.join(path.dirname(args[args.indexOf("--prefix") + 1]), "source");
+        stagedSkills = ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]
+          .filter((dir) => fs.existsSync(path.join(checkout, dir, "skills", "paperclip", "SKILL.md")));
+      }
+      return runCommand(file, args, commandOptions);
+    });
+    await expect(installGitPayload("paperclipai/paperclip", sha, recordingRunCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    expect(stagedSkills).toEqual(["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]);
+    expect(recordingRunCommand.mock.calls.filter(([file, args]) => file === "corepack" && args.includes("pack"))).toHaveLength(3);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
