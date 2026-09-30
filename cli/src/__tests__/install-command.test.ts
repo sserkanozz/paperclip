@@ -227,6 +227,15 @@ describe("managed install commands", () => {
     expect(calls.filter(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh")).toHaveLength(1);
   });
 
+  it("stages bundled packages with per-package workspace versions, since git checkouts can mix workspace versions", async () => {
+    const sha = "f".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const stageCalls = runCommand.mock.calls.filter(([file, args]) => file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"));
+    expect(stageCalls).not.toHaveLength(0);
+    for (const [, args] of stageCalls) expect(args).toContain("--resolve-workspace-versions");
+  });
+
   it("packs the prepared staged server package with --ignore-scripts so prepack does not rerun outside the workspace", async () => {
     const sha = "a".repeat(40);
     const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true });

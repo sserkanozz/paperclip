@@ -7,7 +7,22 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+// Release staging runs after set_public_package_version, so every workspace package
+// shares the consumer's version. Git installs build an unreleased checkout whose
+// workspace versions can differ, so they pass each dependency's own version instead.
+export function resolveWorkspacePackageVersions(sourceRoot = repoRoot) {
+  const manifest = JSON.parse(
+    readFileSync(resolve(sourceRoot, "scripts/release-package-manifest.json"), "utf8"),
+  );
+  return new Map(
+    manifest.map(({ dir, name }) => [
+      name,
+      JSON.parse(readFileSync(resolve(sourceRoot, dir, "package.json"), "utf8")).version,
+    ]),
+  );
+}
+
+export function materializePublishManifest(pkg, { workspaceVersions } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,7 +37,10 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        if (!workspaceVersions) return [name, `${prefix}${pkg.version}`];
+        const version = workspaceVersions.get(name);
+        if (!version) throw new Error(`Cannot materialize ${name}: no workspace package version found`);
+        return [name, `${prefix}${version}`];
       }),
     );
   }
@@ -136,7 +154,11 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
+export function prepareBundledPackage(
+  sourceDir,
+  destinationDir,
+  { sourceRoot = repoRoot, workspaceVersions } = {},
+) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -156,7 +178,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions });
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
@@ -213,10 +235,17 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [sourceDir, destinationDir] = process.argv.slice(2);
-  if (!sourceDir || !destinationDir) {
-    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir>");
+  const [sourceDir, destinationDir, ...flags] = process.argv.slice(2);
+  const knownFlags = new Set(["--resolve-workspace-versions"]);
+  if (!sourceDir || !destinationDir || flags.some((flag) => !knownFlags.has(flag))) {
+    console.error(
+      "Usage: prepare-bundled-package.mjs <source-dir> <destination-dir> [--resolve-workspace-versions]",
+    );
     process.exit(1);
   }
-  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir));
+  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir), {
+    workspaceVersions: flags.includes("--resolve-workspace-versions")
+      ? resolveWorkspacePackageVersions()
+      : undefined,
+  });
 }

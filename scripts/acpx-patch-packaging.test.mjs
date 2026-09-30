@@ -21,6 +21,7 @@ import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  resolveWorkspacePackageVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -173,6 +174,57 @@ test("bundled package staging materializes workspace dependency versions", () =>
     caret: "^2026.723.0",
     tilde: "~2026.723.0",
   });
+});
+
+test("git install staging materializes mixed workspace dependency versions from each dependency", (t) => {
+  const sourceRoot = mkdtempSync(join(tmpdir(), "paperclip-mixed-workspace-versions-"));
+  t.after(() => rmSync(sourceRoot, { recursive: true, force: true }));
+  const packages = [
+    { dir: "server", name: "@paperclipai/server", version: "0.3.1" },
+    { dir: "packages/plugins/sdk", name: "@paperclipai/plugin-sdk", version: "1.0.0" },
+    { dir: "packages/shared", name: "@paperclipai/shared", version: "0.3.1" },
+  ];
+  mkdirSync(join(sourceRoot, "scripts"));
+  writeFileSync(
+    join(sourceRoot, "scripts", "release-package-manifest.json"),
+    JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))),
+  );
+  for (const { dir, name, version } of packages) {
+    mkdirSync(join(sourceRoot, dir), { recursive: true });
+    writeFileSync(join(sourceRoot, dir, "package.json"), JSON.stringify({ name, version }));
+  }
+  const serverManifest = {
+    name: "@paperclipai/server",
+    version: "0.3.1",
+    dependencies: {
+      "@paperclipai/plugin-sdk": "workspace:*",
+      "@paperclipai/shared": "workspace:^",
+      express: "^5.1.0",
+    },
+  };
+
+  const workspaceVersions = resolveWorkspacePackageVersions(sourceRoot);
+  assert.deepEqual(
+    materializePublishManifest(serverManifest, { workspaceVersions }).dependencies,
+    {
+      "@paperclipai/plugin-sdk": "1.0.0",
+      "@paperclipai/shared": "^0.3.1",
+      express: "^5.1.0",
+    },
+  );
+  assert.equal(
+    materializePublishManifest(serverManifest).dependencies["@paperclipai/plugin-sdk"],
+    "0.3.1",
+    "release staging keeps the uniform consumer-version semantics",
+  );
+  assert.throws(
+    () =>
+      materializePublishManifest(
+        { ...serverManifest, dependencies: { "@paperclipai/unknown": "workspace:*" } },
+        { workspaceVersions },
+      ),
+    /@paperclipai\/unknown/,
+  );
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {
