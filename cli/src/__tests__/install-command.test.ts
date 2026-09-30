@@ -227,6 +227,30 @@ describe("managed install commands", () => {
     expect(calls.filter(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh")).toHaveLength(1);
   });
 
+  it("packs the prepared staged server package with --ignore-scripts so prepack does not rerun outside the workspace", async () => {
+    const sha = "a".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    const calls = runCommand.mock.calls;
+    const stageCall = calls.find(([file, args]) =>
+      file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && args[1]?.endsWith(`${path.sep}server`));
+    const stagedPackage = stageCall?.[1][2];
+    expect(stagedPackage).toBeDefined();
+    const npmPackCalls = calls.filter(([file, args]) => file === "npm" && args[0] === "pack");
+    const stagedPackCall = npmPackCalls.find(([, args]) => args[1] === stagedPackage);
+    expect(stagedPackCall?.[1]).toContain("--ignore-scripts");
+    expect(calls.indexOf(stagedPackCall!)).toBeGreaterThan(calls.indexOf(stageCall!));
+    const preparedDirs = calls
+      .filter(([file, args]) => file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))
+      .map(([, args]) => args[2]);
+    for (const [, args] of npmPackCalls.filter(([, args]) => preparedDirs.includes(args[1]))) {
+      expect(args).toContain("--ignore-scripts");
+    }
+    const cliPackCalls = npmPackCalls.filter(([, args]) => !preparedDirs.includes(args[1]));
+    expect(cliPackCalls).toHaveLength(1);
+    expect(cliPackCalls[0]?.[1]).not.toContain("--ignore-scripts");
+  });
+
   it("stages root skills into server and local adapter packages before packing, as release.sh does", async () => {
     const sha = "f".repeat(40);
     const runCommand = createGitCheckoutRunCommand(sha, { serverBundled: true, withLocalAdapters: true });
